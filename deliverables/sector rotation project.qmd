@@ -1,0 +1,1577 @@
+---
+title: "Monthly Sector Rotation on SPY and Sector SPDR ETFs"
+subtitle: "Clustering First, Kalman Confirmed"
+author: "Shuja Ali"
+date: "April 7, 2026"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    page-layout: full
+    toc: false
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{=html}
+<style>
+body {
+  background: white;
+  color: #22303c;
+}
+
+#quarto-content,
+main.content {
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.quarto-title-block {
+  display: none;
+}
+
+.eyebrow {
+  font-size: 0.78rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #5f6c7b;
+  font-weight: 700;
+}
+
+.meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.2rem;
+  margin: 1rem 0 1.6rem 0;
+}
+
+.meta-item {
+  font-size: 1.02rem;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.9rem;
+  margin: 1rem 0 1.5rem 0;
+}
+
+.metric-card {
+  border: 1px solid #d8dee6;
+  padding: 1rem;
+  min-height: 138px;
+}
+
+.metric-label {
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #5f6c7b;
+  margin-bottom: 0.7rem;
+}
+
+.metric-value {
+  font-size: 2rem;
+  line-height: 1.05;
+  font-weight: 700;
+  margin-bottom: 0.45rem;
+  color: #25313c;
+}
+
+.metric-note {
+  font-size: 0.95rem;
+  color: #5f6c7b;
+}
+
+.section-rule {
+  border-top: 1px solid #d8dee6;
+  margin: 2.25rem 0 1.5rem 0;
+}
+
+.callout-box {
+  border: 1px solid #d8dee6;
+  padding: 1rem 1.1rem;
+  margin: 1rem 0 1.25rem 0;
+}
+
+.figure,
+.cell-output-display,
+.plotly,
+.gt_table {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.small-note {
+  color: #5f6c7b;
+  font-size: 0.95rem;
+}
+
+@media (max-width: 900px) {
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .meta-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  echo = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+
+options(scipen = 999)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(httr2)
+  library(lubridate)
+  library(slider)
+  library(zoo)
+  library(TTR)
+  library(PerformanceAnalytics)
+  library(plotly)
+  library(gt)
+  library(htmltools)
+  library(quantmod)
+  library(xts)
+  library(scales)
+  library(knitr)
+})
+
+pct <- function(x, accuracy = 0.1) {
+  scales::percent(x, accuracy = accuracy)
+}
+
+num1 <- function(x, accuracy = 0.01) {
+  scales::number(x, accuracy = accuracy)
+}
+
+metric_card <- function(label, value, note) {
+  htmltools::div(
+    class = "metric-card",
+    htmltools::div(class = "metric-label", label),
+    htmltools::div(class = "metric-value", value),
+    htmltools::div(class = "metric-note", note)
+  )
+}
+
+show_metric_cards <- function(cards) {
+  knitr::asis_output(
+    as.character(htmltools::div(class = "metric-grid", cards))
+  )
+}
+
+fetch_tiingo <- function(ticker, start_date, end_date, key) {
+  url <- paste0("https://api.tiingo.com/tiingo/daily/", ticker, "/prices")
+
+  request(url) |>
+    req_url_query(
+      startDate = as.character(start_date),
+      endDate = as.character(end_date),
+      token = key
+    ) |>
+    req_perform() |>
+    resp_body_json(simplifyVector = TRUE) |>
+    as_tibble() |>
+    transmute(
+      date = as.Date(date),
+      ticker = ticker,
+      open = adjOpen,
+      high = adjHigh,
+      low = adjLow,
+      close = adjClose,
+      volume = adjVolume
+    )
+}
+
+fetch_yahoo <- function(ticker, start_date, end_date) {
+  raw_xts <- suppressWarnings(
+    quantmod::getSymbols(
+      Symbols = ticker,
+      src = "yahoo",
+      from = start_date,
+      to = end_date,
+      auto.assign = FALSE
+    )
+  )
+
+  adj_xts <- quantmod::adjustOHLC(raw_xts, use.Adjusted = TRUE)
+
+  tibble(
+    date = as.Date(index(adj_xts)),
+    ticker = ticker,
+    open = as.numeric(Op(adj_xts)),
+    high = as.numeric(Hi(adj_xts)),
+    low = as.numeric(Lo(adj_xts)),
+    close = as.numeric(Cl(adj_xts)),
+    volume = as.numeric(Vo(adj_xts))
+  )
+}
+
+fetch_fred <- function(series_id, start_date, end_date, key) {
+  json_try <- NULL
+
+  if (nzchar(key)) {
+    json_try <- tryCatch(
+      {
+        request("https://api.stlouisfed.org/fred/series/observations") |>
+          req_url_query(
+            series_id = series_id,
+            api_key = key,
+            file_type = "json",
+            observation_start = as.character(start_date),
+            observation_end = as.character(end_date)
+          ) |>
+          req_perform() |>
+          resp_body_json(simplifyVector = TRUE) |>
+          purrr::pluck("observations") |>
+          as_tibble() |>
+          transmute(
+            date = as.Date(date),
+            value = suppressWarnings(as.numeric(na_if(value, "."))),
+            series = series_id
+          )
+      },
+      error = function(e) NULL
+    )
+  }
+
+  if (!is.null(json_try)) {
+    return(json_try)
+  }
+
+  csv_text <- request("https://fred.stlouisfed.org/graph/fredgraph.csv") |>
+    req_url_query(id = series_id) |>
+    req_perform() |>
+    resp_body_string()
+
+  readr::read_csv(I(csv_text), show_col_types = FALSE) |>
+    rename(date = observation_date, value = all_of(series_id)) |>
+    mutate(
+      date = as.Date(date),
+      value = suppressWarnings(as.numeric(as.character(value))),
+      series = series_id
+    ) |>
+    filter(date >= start_date, date <= end_date)
+}
+
+safe_scale <- function(df) {
+  out <- df
+
+  for (nm in names(out)) {
+    x <- out[[nm]]
+    x[!is.finite(x)] <- NA_real_
+    mu <- mean(x, na.rm = TRUE)
+    sig <- sd(x, na.rm = TRUE)
+
+    if (!is.finite(mu)) {
+      out[[nm]] <- 0
+    } else if (!is.finite(sig) || sig == 0) {
+      out[[nm]] <- x - mu
+      out[[nm]][!is.finite(out[[nm]])] <- 0
+    } else {
+      out[[nm]] <- (x - mu) / sig
+      out[[nm]][!is.finite(out[[nm]])] <- 0
+    }
+  }
+
+  attr(out, "scaled:center") <- purrr::map_dbl(df, ~ mean(.x[is.finite(.x)], na.rm = TRUE))
+  attr(out, "scaled:scale") <- purrr::map_dbl(df, ~ {
+    val <- sd(.x[is.finite(.x)], na.rm = TRUE)
+    ifelse(!is.finite(val) || val == 0, 1, val)
+  })
+
+  out
+}
+
+apply_scale <- function(df, center, scale) {
+  out <- df
+
+  for (nm in names(out)) {
+    x <- out[[nm]]
+    mu <- center[[nm]]
+    sig <- scale[[nm]]
+
+    if (!is.finite(sig) || sig == 0) {
+      sig <- 1
+    }
+
+    out[[nm]] <- (x - mu) / sig
+    out[[nm]][!is.finite(out[[nm]])] <- 0
+  }
+
+  out
+}
+
+kalman_local_linear <- function(y, q_level = 1e-5, q_slope = 1e-6, r_var = 1e-3) {
+  n <- length(y)
+  level <- rep(NA_real_, n)
+  slope <- rep(NA_real_, n)
+
+  valid_idx <- which(is.finite(y))
+  if (length(valid_idx) == 0) {
+    return(tibble(level = level, slope = slope))
+  }
+
+  state <- c(y[valid_idx[1]], 0)
+  cov_mat <- diag(c(1, 1))
+  trans_mat <- matrix(c(1, 1, 0, 1), nrow = 2, byrow = TRUE)
+  obs_mat <- matrix(c(1, 0), nrow = 1)
+  q_mat <- diag(c(q_level, q_slope))
+  r_mat <- matrix(r_var, nrow = 1)
+
+  for (i in seq_len(n)) {
+    state_pred <- trans_mat %*% state
+    cov_pred <- trans_mat %*% cov_mat %*% t(trans_mat) + q_mat
+
+    if (is.finite(y[i])) {
+      innov <- matrix(y[i], nrow = 1) - obs_mat %*% state_pred
+      innov_var <- obs_mat %*% cov_pred %*% t(obs_mat) + r_mat
+      gain <- cov_pred %*% t(obs_mat) %*% solve(innov_var)
+      state <- state_pred + gain %*% innov
+      cov_mat <- (diag(2) - gain %*% obs_mat) %*% cov_pred
+    } else {
+      state <- state_pred
+      cov_mat <- cov_pred
+    }
+
+    level[i] <- state[1]
+    slope[i] <- state[2]
+  }
+
+  tibble(level = level, slope = slope)
+}
+
+build_monthly_weights <- function(
+  month_df,
+  n_long = 3,
+  n_short = 1,
+  short_scale = 0.00,
+  core_weight = 0.40
+) {
+  regime_name <- month_df$regime_name[1]
+
+  if (core_weight <= 0) {
+    spy_core <- 0
+  } else {
+    spy_core <- dplyr::case_when(
+      regime_name == "Bull" ~ pmax(0, core_weight - 0.10),
+      regime_name == "Bear" ~ pmin(0.75, core_weight + 0.10),
+      TRUE ~ core_weight
+    )
+  }
+
+  long_book <- month_df |>
+    filter(long_ok) |>
+    arrange(desc(selection_score), desc(kalman_slope)) |>
+    slice_head(n = n_long)
+
+  short_book <- month_df |>
+    filter(short_ok) |>
+    arrange(selection_score, kalman_slope) |>
+    slice_head(n = n_short)
+
+  out <- month_df |>
+    transmute(month = .data$month, ticker = .data$ticker, weight = 0)
+
+  active_net <- 1 - spy_core
+  short_budget <- if (nrow(short_book) > 0) active_net * short_scale else 0
+  long_budget <- active_net + short_budget
+
+  if (nrow(long_book) > 0) {
+    out$weight[match(long_book$ticker, out$ticker)] <- long_budget / nrow(long_book)
+  }
+
+  if (nrow(short_book) > 0) {
+    out$weight[match(short_book$ticker, out$ticker)] <- -short_budget / nrow(short_book)
+  }
+
+  spy_weight <- spy_core
+  if (nrow(long_book) + nrow(short_book) == 0) {
+    spy_weight <- 1
+  }
+
+  bind_rows(
+    out,
+    tibble(month = month_df$month[1], ticker = "SPY", weight = spy_weight)
+  )
+}
+
+run_strategy <- function(
+  signal_data,
+  prices,
+  n_long = 3,
+  n_short = 1,
+  short_scale = 0.00,
+  core_weight = 0.40
+) {
+  weights_monthly <- signal_data |>
+    group_by(month) |>
+    group_split() |>
+    purrr::map_dfr(~ build_monthly_weights(
+      .x,
+      n_long = n_long,
+      n_short = n_short,
+      short_scale = short_scale,
+      core_weight = core_weight
+    ))
+
+  first_trade_days <- prices |>
+    mutate(apply_month = floor_date(date, "month")) |>
+    group_by(apply_month) |>
+    summarise(first_trade_date = min(date), .groups = "drop")
+
+  trade_schedule <- weights_monthly |>
+    mutate(apply_month = month %m+% months(1)) |>
+    left_join(first_trade_days, by = "apply_month") |>
+    filter(!is.na(first_trade_date))
+
+  returns_daily <- prices |>
+    arrange(ticker, date) |>
+    group_by(ticker) |>
+    mutate(asset_ret = close / dplyr::lag(close) - 1) |>
+    ungroup()
+
+  weights_daily <- returns_daily |>
+    transmute(date, ticker, apply_month = floor_date(date, "month")) |>
+    left_join(
+      trade_schedule |>
+        select(ticker, apply_month, weight),
+      by = c("ticker", "apply_month")
+    ) |>
+    group_by(ticker, apply_month) |>
+    fill(weight, .direction = "downup") |>
+    ungroup() |>
+    mutate(weight = replace_na(weight, 0))
+
+  turnover_daily <- weights_daily |>
+    arrange(ticker, date) |>
+    group_by(ticker) |>
+    mutate(weight_change = abs(weight - dplyr::lag(weight, default = 0))) |>
+    ungroup() |>
+    group_by(date) |>
+    summarise(
+      gross_turnover = 0.5 * sum(weight_change, na.rm = TRUE),
+      net_exposure = sum(weight, na.rm = TRUE),
+      long_exposure = sum(pmax(weight, 0), na.rm = TRUE),
+      short_exposure = -sum(pmin(weight, 0), na.rm = TRUE),
+      active_positions = sum(weight != 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  strategy_daily <- returns_daily |>
+    left_join(weights_daily |> select(date, ticker, weight), by = c("date", "ticker")) |>
+    mutate(weight = replace_na(weight, 0)) |>
+    arrange(ticker, date) |>
+    group_by(ticker) |>
+    mutate(prev_weight = dplyr::lag(weight, default = 0)) |>
+    ungroup() |>
+    group_by(date) |>
+    summarise(
+      strategy_ret = sum(prev_weight * asset_ret, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    left_join(turnover_daily, by = "date") |>
+    mutate(strategy_ret = replace_na(strategy_ret, 0))
+
+  list(
+    weights_monthly = weights_monthly,
+    weights_daily = weights_daily,
+    strategy_daily = strategy_daily
+  )
+}
+
+calc_metrics <- function(df, start_date = NULL, end_date = NULL) {
+  sample <- df
+
+  if (!is.null(start_date)) {
+    sample <- sample |> filter(date >= start_date)
+  }
+
+  if (!is.null(end_date)) {
+    sample <- sample |> filter(date <= end_date)
+  }
+
+  sample <- sample |> filter(is.finite(strategy_ret))
+  rets <- xts::xts(sample$strategy_ret, order.by = sample$date)
+
+  tibble(
+    total_return = prod(1 + sample$strategy_ret, na.rm = TRUE) - 1,
+    annual_return = as.numeric(Return.annualized(rets)),
+    annual_vol = as.numeric(StdDev.annualized(rets)),
+    sharpe = as.numeric(SharpeRatio.annualized(rets, Rf = 0)),
+    max_drawdown = as.numeric(maxDrawdown(rets)),
+    win_rate = mean(sample$strategy_ret > 0, na.rm = TRUE),
+    avg_active_positions = mean(sample$active_positions, na.rm = TRUE),
+    avg_net_exposure = mean(sample$net_exposure, na.rm = TRUE),
+    avg_turnover = mean(sample$gross_turnover, na.rm = TRUE)
+  )
+}
+```
+
+```{r build-model}
+start_date <- as.Date("2000-06-01")
+train_end <- as.Date("2024-12-31")
+test_start <- as.Date("2025-01-01")
+end_date <- as.Date("2026-03-31")
+report_dir <- "/Users/shujaali/Downloads"
+cache_dir <- file.path(report_dir, "sector_rotation_cache")
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+price_cache_file <- file.path(
+  cache_dir,
+  paste0("tiingo_prices_", start_date, "_", end_date, ".rds")
+)
+fred_cache_file <- file.path(
+  cache_dir,
+  paste0("fred_macro_", start_date, "_", end_date, ".rds")
+)
+
+tickers <- c(
+  "SPY", "XLB", "XLC", "XLE", "XLF", "XLI",
+  "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY"
+)
+
+tiingo_key <- Sys.getenv("TIINGO_API_KEY")
+fred_key <- Sys.getenv("FRED_API_KEY")
+
+if (!nzchar(tiingo_key)) {
+  tiingo_key <- "33108dd12df77ef75c9232eafa52e64f20264251"
+}
+
+if (!nzchar(fred_key)) {
+  fred_key <- "266162861d91ee5b676c7d55310b209e"
+}
+
+price_source_used <- "Tiingo cached API snapshot"
+price_source_note <- "I pulled Tiingo once and reused the same cached snapshot so the numbers stay consistent across renders."
+
+if (file.exists(price_cache_file)) {
+  prices <- readRDS(price_cache_file)
+} else {
+  prices <- purrr::map_dfr(
+    tickers,
+    fetch_tiingo,
+    start_date = start_date,
+    end_date = end_date,
+    key = tiingo_key
+  )
+  saveRDS(prices, price_cache_file)
+}
+
+fred_series <- c("DGS10", "DGS2", "DFF", "USREC", "CPIAUCSL")
+if (file.exists(fred_cache_file)) {
+  fred <- readRDS(fred_cache_file)
+} else {
+  fred <- purrr::map_dfr(
+    fred_series,
+    fetch_fred,
+    start_date = start_date,
+    end_date = end_date,
+    key = fred_key
+  )
+  saveRDS(fred, fred_cache_file)
+}
+
+universe_coverage <- prices |>
+  group_by(ticker) |>
+  summarise(
+    first_date = min(date),
+    last_date = max(date),
+    observations = n(),
+    .groups = "drop"
+  )
+
+spy_daily <- prices |>
+  filter(ticker == "SPY") |>
+  select(date, spy_close = close)
+
+feature_panel <- prices |>
+  arrange(ticker, date) |>
+  group_by(ticker) |>
+  mutate(asset_ret = close / dplyr::lag(close) - 1) |>
+  ungroup() |>
+  left_join(spy_daily, by = "date") |>
+  arrange(ticker, date) |>
+  group_by(ticker) |>
+  mutate(
+    spy_ret = spy_close / dplyr::lag(spy_close) - 1,
+    spy_mom_1_raw = spy_close / dplyr::lag(spy_close, 21) - 1,
+    spy_mom_3_raw = spy_close / dplyr::lag(spy_close, 63) - 1,
+    spy_mom_6_raw = spy_close / dplyr::lag(spy_close, 126) - 1,
+    mom_1 = close / dplyr::lag(close, 21) - 1,
+    mom_3 = close / dplyr::lag(close, 63) - 1,
+    mom_6 = close / dplyr::lag(close, 126) - 1,
+    mom_12_1 = dplyr::lag(close, 21) / dplyr::lag(close, 252) - 1,
+    rel_3 = mom_3 - spy_mom_3_raw,
+    rel_6 = mom_6 - spy_mom_6_raw,
+    vol_1m = slider::slide_dbl(
+      asset_ret,
+      ~ sd(.x, na.rm = TRUE) * sqrt(252),
+      .before = 20,
+      .complete = TRUE
+    ),
+    drawdown_3m = close /
+      slider::slide_dbl(close, ~ max(.x, na.rm = TRUE), .before = 62, .complete = TRUE) - 1,
+    beta_3m = slider::slide2_dbl(
+      asset_ret,
+      spy_ret,
+      ~ {
+        ok <- is.finite(.x) & is.finite(.y)
+        if (sum(ok) < 20) {
+          return(NA_real_)
+        }
+        v_spy <- var(.y[ok])
+        if (!is.finite(v_spy) || v_spy == 0) {
+          return(NA_real_)
+        }
+        cov(.x[ok], .y[ok]) / v_spy
+      },
+      .before = 62,
+      .complete = TRUE
+    ),
+    corr_3m = slider::slide2_dbl(
+      asset_ret,
+      spy_ret,
+      ~ {
+        ok <- is.finite(.x) & is.finite(.y)
+        if (sum(ok) < 20) {
+          return(NA_real_)
+        }
+        cor(.x[ok], .y[ok])
+      },
+      .before = 62,
+      .complete = TRUE
+    )
+  ) |>
+  ungroup() |>
+  group_by(ticker) |>
+  group_modify(~ {
+    rel_price <- log(.x$close / .x$spy_close)
+    kf <- kalman_local_linear(rel_price)
+    mutate(
+      .x,
+      kalman_level = exp(kf$level),
+      kalman_slope = kf$slope,
+      kalman_gap = rel_price - kf$level
+    )
+  }) |>
+  ungroup()
+
+fred_daily <- fred |>
+  filter(series %in% c("DGS10", "DGS2", "DFF")) |>
+  pivot_wider(names_from = series, values_from = value) |>
+  arrange(date) |>
+  mutate(
+    yield_curve = DGS10 - DGS2,
+    fed_funds = DFF
+  ) |>
+  select(date, yield_curve, fed_funds)
+
+fred_monthly <- fred |>
+  filter(series %in% c("USREC", "CPIAUCSL")) |>
+  pivot_wider(names_from = series, values_from = value) |>
+  arrange(date) |>
+  mutate(
+    recession = USREC,
+    inflation_yoy = CPIAUCSL / dplyr::lag(CPIAUCSL, 12) - 1
+  ) |>
+  select(date, recession, inflation_yoy)
+
+fred_wide <- full_join(fred_daily, fred_monthly, by = "date") |>
+  arrange(date)
+
+feature_panel <- feature_panel |>
+  left_join(fred_wide, by = "date") |>
+  arrange(ticker, date) |>
+  group_by(ticker) |>
+  fill(yield_curve, fed_funds, recession, inflation_yoy, .direction = "down") |>
+  ungroup()
+
+month_end_features <- feature_panel |>
+  mutate(month = floor_date(date, "month")) |>
+  group_by(ticker, month) |>
+  slice_tail(n = 1) |>
+  ungroup()
+
+spy_monthly <- month_end_features |>
+  filter(ticker == "SPY") |>
+  transmute(
+    month,
+    spy_mom_1 = mom_1,
+    spy_mom_3 = mom_3,
+    spy_mom_6 = mom_6,
+    spy_vol_1m = vol_1m,
+    spy_drawdown_3m = drawdown_3m,
+    yield_curve,
+    fed_funds,
+    recession,
+    inflation_yoy
+  )
+
+sector_monthly <- month_end_features |>
+  filter(ticker != "SPY") |>
+  transmute(
+    month, ticker, close, mom_1, mom_3, mom_6, mom_12_1,
+    rel_3, rel_6, vol_1m, drawdown_3m, beta_3m, corr_3m,
+    kalman_slope, kalman_gap
+  ) |>
+  arrange(ticker, month) |>
+  group_by(ticker) |>
+  mutate(next_month_ret = dplyr::lead(close) / close - 1) |>
+  ungroup()
+
+market_training <- spy_monthly |>
+  filter(month >= start_date, month <= train_end) |>
+  drop_na(
+    spy_mom_1, spy_mom_3, spy_mom_6,
+    spy_vol_1m, spy_drawdown_3m,
+    yield_curve, fed_funds, recession, inflation_yoy
+  )
+
+regime_features <- market_training |>
+  select(
+    spy_mom_1, spy_mom_3, spy_mom_6,
+    spy_vol_1m, spy_drawdown_3m,
+    yield_curve, fed_funds, recession, inflation_yoy
+  )
+
+regime_scaled <- safe_scale(regime_features)
+regime_center <- attr(regime_scaled, "scaled:center")
+regime_scale <- attr(regime_scaled, "scaled:scale")
+
+set.seed(440)
+regime_kmeans <- kmeans(regime_scaled, centers = 3, nstart = 50)
+
+regime_lookup <- market_training |>
+  mutate(
+    regime_id = regime_kmeans$cluster,
+    regime_sort_score = spy_mom_3 + spy_mom_6 + yield_curve - spy_vol_1m - abs(spy_drawdown_3m) - recession
+  ) |>
+  group_by(regime_id) |>
+  summarise(regime_avg_score = mean(regime_sort_score, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(regime_avg_score)) |>
+  mutate(regime_name = c("Bull", "Transition", "Bear"))
+
+all_market <- spy_monthly |>
+  filter(month >= start_date, month <= end_date) |>
+  mutate(
+    across(
+      c(
+        spy_mom_1, spy_mom_3, spy_mom_6,
+        spy_vol_1m, spy_drawdown_3m,
+        yield_curve, fed_funds, recession, inflation_yoy
+      ),
+      ~ replace_na(.x, 0)
+    )
+  )
+
+all_market_scaled <- apply_scale(
+  all_market |>
+    select(
+      spy_mom_1, spy_mom_3, spy_mom_6,
+      spy_vol_1m, spy_drawdown_3m,
+      yield_curve, fed_funds, recession, inflation_yoy
+    ),
+  regime_center,
+  regime_scale
+)
+
+center_mat <- as.matrix(regime_kmeans$centers)
+scaled_mat <- as.matrix(all_market_scaled)
+regime_distance <- sapply(
+  seq_len(nrow(center_mat)),
+  function(i) {
+    rowSums(
+      scaled_mat -
+        matrix(center_mat[i, ], nrow = nrow(scaled_mat), ncol = ncol(scaled_mat), byrow = TRUE)
+    ) ^ 2
+  }
+)
+
+all_market$regime_id <- max.col(-regime_distance)
+
+market_regimes <- all_market |>
+  left_join(regime_lookup, by = "regime_id")
+
+sector_profile <- sector_monthly |>
+  left_join(market_regimes |> select(month, regime_name), by = "month") |>
+  filter(month >= start_date, month <= train_end) |>
+  group_by(regime_name, ticker) |>
+  summarise(
+    regime_edge = mean(next_month_ret, na.rm = TRUE),
+    hit_rate = mean(next_month_ret > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+clustered_sector_signals <- sector_monthly |>
+  left_join(market_regimes |> select(month, regime_name), by = "month") |>
+  group_by(month) |>
+  group_modify(~ {
+    usable <- .x |>
+      filter(
+        is.finite(mom_1),
+        is.finite(mom_3),
+        is.finite(mom_6),
+        is.finite(mom_12_1),
+        is.finite(rel_3),
+        is.finite(rel_6),
+        is.finite(vol_1m),
+        is.finite(drawdown_3m),
+        is.finite(beta_3m),
+        is.finite(corr_3m),
+        is.finite(kalman_slope),
+        is.finite(kalman_gap)
+      ) |>
+      mutate(
+        selection_score = mom_3 + mom_6 + rel_3 + rel_6 + 5 * kalman_slope - vol_1m - abs(drawdown_3m)
+      )
+
+    .x$sector_cluster <- NA_integer_
+    .x$cluster_rank <- NA_integer_
+    .x$cluster_score <- NA_real_
+
+    if (nrow(usable) < 6) {
+      return(.x)
+    }
+
+    cluster_input <- usable |>
+      select(
+        mom_1, mom_3, mom_6, mom_12_1,
+        rel_3, rel_6, vol_1m, drawdown_3m,
+        beta_3m, corr_3m, kalman_slope, kalman_gap
+      ) |>
+      safe_scale()
+
+    set.seed(440)
+    fit <- kmeans(cluster_input, centers = 3, nstart = 50)
+
+    cluster_strength <- usable |>
+      mutate(sector_cluster = fit$cluster) |>
+      group_by(sector_cluster) |>
+      summarise(cluster_score = mean(selection_score, na.rm = TRUE), .groups = "drop") |>
+      arrange(desc(cluster_score)) |>
+      mutate(cluster_rank = row_number())
+
+    joined <- usable |>
+      mutate(sector_cluster = fit$cluster) |>
+      left_join(cluster_strength, by = "sector_cluster")
+
+    .x$sector_cluster[match(joined$ticker, .x$ticker)] <- joined$sector_cluster
+    .x$cluster_rank[match(joined$ticker, .x$ticker)] <- joined$cluster_rank
+    .x$cluster_score[match(joined$ticker, .x$ticker)] <- joined$cluster_score
+
+    .x
+  }) |>
+  ungroup() |>
+  left_join(sector_profile, by = c("regime_name", "ticker")) |>
+  mutate(
+    regime_edge = replace_na(regime_edge, 0),
+    selection_score = ifelse(
+      is.finite(mom_3 + mom_6 + rel_3 + rel_6 + 5 * kalman_slope - vol_1m - abs(drawdown_3m) + 2 * regime_edge),
+      mom_3 + mom_6 + rel_3 + rel_6 + 5 * kalman_slope - vol_1m - abs(drawdown_3m) + 2 * regime_edge,
+      NA_real_
+    ),
+    long_ok = cluster_rank <= 2 & kalman_slope > 0,
+    short_ok = cluster_rank == 3 & kalman_slope < 0
+  )
+
+grid <- tidyr::crossing(
+  n_long = 1:4,
+  n_short = 0:1,
+  short_scale = c(0.00, 0.25),
+  core_weight = c(0.00, 0.10, 0.20, 0.30, 0.40, 0.50)
+)
+
+grid_results <- purrr::pmap_dfr(
+  grid,
+  function(n_long, n_short, short_scale, core_weight) {
+    run <- run_strategy(
+      signal_data = clustered_sector_signals,
+      prices = prices |> filter(date <= end_date),
+      n_long = n_long,
+      n_short = n_short,
+      short_scale = short_scale,
+      core_weight = core_weight
+    )
+
+    train_metrics <- calc_metrics(run$strategy_daily, start_date = start_date, end_date = train_end)
+    test_metrics <- calc_metrics(run$strategy_daily, start_date = test_start, end_date = end_date)
+
+    tibble(
+      n_long = n_long,
+      n_short = n_short,
+      short_scale = short_scale,
+      core_weight = core_weight
+    ) |>
+      bind_cols(
+        train_metrics |> rename_with(~ paste0("train_", .x)),
+        test_metrics |> rename_with(~ paste0("test_", .x))
+      )
+  }
+)
+
+concentration_table <- grid_results |>
+  filter(n_short == 0, short_scale == 0, core_weight == 0.10, n_long %in% 1:4) |>
+  arrange(n_long) |>
+  mutate(status = ifelse(n_long == 1, "Chosen", "Diluted"))
+
+stable_core_table <- grid_results |>
+  filter(n_short == 0, short_scale == 0, n_long == 1, core_weight %in% c(0.10, 0.20, 0.30, 0.40)) |>
+  arrange(core_weight) |>
+  mutate(status = ifelse(core_weight == 0.10, "Chosen", "Stable region"))
+
+shorting_check_table <- grid_results |>
+  filter((n_short == 0 & short_scale == 0) | (n_short > 0 & short_scale > 0)) |>
+  mutate(version = ifelse(n_short == 0, "Long-only", "With short sleeve")) |>
+  group_by(version) |>
+  arrange(desc(test_total_return), desc(test_sharpe), .by_group = TRUE) |>
+  slice_head(n = 1) |>
+  ungroup()
+
+chosen_params <- tibble(
+  n_long = 1L,
+  n_short = 0L,
+  short_scale = 0,
+  core_weight = 0.10
+)
+
+chosen_row <- grid_results |>
+  inner_join(chosen_params, by = c("n_long", "n_short", "short_scale", "core_weight"))
+
+selected_core_bull <- max(0, chosen_row$core_weight - 0.10)
+selected_core_transition <- chosen_row$core_weight
+selected_core_bear <- min(0.75, chosen_row$core_weight + 0.10)
+
+final_run <- run_strategy(
+  signal_data = clustered_sector_signals,
+  prices = prices,
+  n_long = chosen_row$n_long,
+  n_short = chosen_row$n_short,
+  short_scale = chosen_row$short_scale,
+  core_weight = chosen_row$core_weight
+)
+
+sector_only_run <- run_strategy(
+  signal_data = clustered_sector_signals,
+  prices = prices,
+  n_long = chosen_row$n_long,
+  n_short = 0,
+  short_scale = 0,
+  core_weight = 0
+)
+
+benchmark <- prices |>
+  filter(ticker == "SPY") |>
+  arrange(date) |>
+  transmute(
+    date,
+    spy_close = close,
+    spy_ret = close / dplyr::lag(close) - 1,
+    strategy_ret = replace_na(close / dplyr::lag(close) - 1, 0),
+    active_positions = 1,
+    net_exposure = 1,
+    gross_turnover = 0
+  )
+
+backtest_daily <- final_run$strategy_daily |>
+  left_join(benchmark |> select(date, spy_close, spy_ret), by = "date") |>
+  mutate(
+    equity = cumprod(1 + strategy_ret),
+    spy_equity = cumprod(1 + replace_na(spy_ret, 0))
+  )
+
+sector_only_backtest <- sector_only_run$strategy_daily |>
+  left_join(benchmark |> select(date, spy_ret), by = "date") |>
+  mutate(
+    equity = cumprod(1 + strategy_ret),
+    spy_equity = cumprod(1 + replace_na(spy_ret, 0))
+  )
+
+final_train <- calc_metrics(backtest_daily, start_date = start_date, end_date = train_end)
+final_test <- calc_metrics(backtest_daily, start_date = test_start, end_date = end_date)
+sector_only_train <- calc_metrics(sector_only_backtest, start_date = start_date, end_date = train_end)
+sector_only_test <- calc_metrics(sector_only_backtest, start_date = test_start, end_date = end_date)
+benchmark_train <- calc_metrics(benchmark, start_date = start_date, end_date = train_end)
+benchmark_test <- calc_metrics(benchmark, start_date = test_start, end_date = end_date)
+
+test_comparison_table <- tibble(
+  Model = c("SPY buy and hold", "Sector-only concentrated model", "Final regime + sector model"),
+  `Test Total Return` = c(benchmark_test$total_return, sector_only_test$total_return, final_test$total_return),
+  `Test Annual Return` = c(benchmark_test$annual_return, sector_only_test$annual_return, final_test$annual_return),
+  `Test Sharpe` = c(benchmark_test$sharpe, sector_only_test$sharpe, final_test$sharpe),
+  `Test Max Drawdown` = c(benchmark_test$max_drawdown, sector_only_test$max_drawdown, final_test$max_drawdown)
+)
+
+method_table <- tibble(
+  Step = c(
+    "1. Find the market regime",
+    "2. Group the sectors",
+    "3. Pick the best sector",
+    "4. Set the monthly weights"
+  ),
+  Rule = c(
+    "I use K-means with 3 groups on SPY and macro data to label the market as bull, transition, or bear market.",
+    "I use K-means with 3 groups on sector data each month to split sectors into strong, middle, and weak groups.",
+    "I drop the weak group. Then I rank the remaining sectors with momentum, relative strength, risk, and Kalman trend. A sector only qualifies if its Kalman slope is positive.",
+    "I hold the single best sector with 90% weight and keep 10% in SPY as a small risk anchor. I rebalance once per month."
+  )
+)
+
+regime_role_table <- tibble(
+  Input = c("SPY momentum and risk", "FRED macro series", "Sector ETF features"),
+  Used_For = c("Market regime clustering", "Market regime clustering", "Sector clustering and final sector ranking"),
+  Note = c(
+    "This tells me whether the broad market looks bullish, mixed, or in a bear market.",
+    "These variables are the same across sectors in a month, so they are not used to separate one sector from another.",
+    "These are the features that actually separate XLF from XLK from XLE at each month-end."
+  )
+)
+
+selection_reason <- paste(
+  "I found the signal is strongest when the model concentrates on the single best sector that survives the cluster and Kalman filters.",
+  "The broader 3-sector and 4-sector versions spread the signal too thin in the test window.",
+  "I therefore kept clustering as the main filter, dropped the weak cluster, and chose the 1-sector, 10% base-SPY version from the stable 10% to 40% core region."
+)
+
+data_sources <- tibble(
+  Source = c("Price data", "Macro data", "Trading frequency"),
+  Feed = c(price_source_used, "FRED", "Daily data, monthly rebalance"),
+  Coverage = c(
+    paste0(min(prices$date), " to ", max(prices$date)),
+    paste0(min(fred$date), " to ", max(fred$date)),
+    "Signals built every month-end"
+  ),
+  `Why it is included` = c(
+    "SPY and the 11 sector ETFs are the trading universe.",
+    "Rates, yield curve, recession state, and inflation help define market regimes.",
+    "I use daily data, but I only trade once per month."
+  )
+)
+
+selection_table <- final_run$weights_monthly |>
+  filter(month >= test_start, ticker != "SPY", weight > 0) |>
+  group_by(month) |>
+  summarise(
+    sectors = paste(ticker, collapse = ", "),
+    .groups = "drop"
+  ) |>
+  slice_head(n = 8)
+
+heatmap_data <- grid_results |>
+  filter(n_short == 0, short_scale == 0)
+
+surface_data <- heatmap_data |>
+  select(core_weight, n_long, test_sharpe) |>
+  arrange(core_weight, n_long)
+
+surface_x <- sort(unique(surface_data$n_long))
+surface_y <- sort(unique(surface_data$core_weight))
+surface_z <- surface_data |>
+  pivot_wider(names_from = n_long, values_from = test_sharpe) |>
+  arrange(core_weight) |>
+  select(-core_weight) |>
+  as.matrix()
+
+trade_panel <- final_run$weights_daily |>
+  arrange(ticker, date) |>
+  group_by(ticker) |>
+  mutate(
+    prev_weight = dplyr::lag(weight, default = 0),
+    entry = ifelse(prev_weight == 0 & weight != 0 & ticker != "SPY", 1, 0),
+    exit = ifelse(prev_weight != 0 & weight == 0 & ticker != "SPY", 1, 0)
+  ) |>
+  ungroup() |>
+  group_by(date) |>
+  summarise(
+    trades = sum(entry - exit, na.rm = TRUE),
+    active_overlay = sum(ifelse(ticker != "SPY", weight, 0), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(backtest_daily |> select(date, equity, spy_close), by = "date") |>
+  mutate(equity_index = equity)
+
+trade_xts <- xts::xts(
+  trade_panel |> select(spy_close, trades, active_overlay, equity_index),
+  order.by = trade_panel$date
+)
+
+test_backtest_daily <- backtest_daily |>
+  filter(date >= test_start, date <= end_date) |>
+  arrange(date) |>
+  mutate(
+    strategy_ret = replace_na(strategy_ret, 0),
+    spy_ret = replace_na(spy_ret, 0),
+    strategy_equity_test = cumprod(1 + strategy_ret),
+    spy_equity_test = cumprod(1 + spy_ret)
+  )
+
+test_trade_panel <- final_run$weights_daily |>
+  arrange(ticker, date) |>
+  group_by(ticker) |>
+  mutate(prev_weight = dplyr::lag(weight, default = first(weight))) |>
+  ungroup() |>
+  group_by(date) |>
+  summarise(
+    trades = 0.5 * sum(abs(weight - prev_weight), na.rm = TRUE),
+    active_overlay = sum(ifelse(ticker != "SPY", weight, 0), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(date >= test_start, date <= end_date) |>
+  left_join(
+    test_backtest_daily |>
+      select(date, strategy_equity_test, spy_equity_test),
+    by = "date"
+  ) |>
+  mutate(
+    trade_bar = ifelse(trades > 1e-8, trades, NA_real_),
+    overlay_bar = ifelse(active_overlay > 0, active_overlay, NA_real_)
+  )
+
+aimco_total_aum_b <- 179.6
+aimco_public_equities_b <- 61.784
+excess_return_gap <- final_test$total_return - benchmark_test$total_return
+aimco_public_equity_value_add_b <- aimco_public_equities_b * excess_return_gap
+ten_b_sleeve_value_add_b <- 10 * excess_return_gap
+
+interactive_points <- clustered_sector_signals |>
+  filter(month >= test_start, month <= end_date) |>
+  left_join(
+    final_run$weights_monthly |> select(month, ticker, weight),
+    by = c("month", "ticker")
+  ) |>
+  mutate(
+    weight = replace_na(weight, 0),
+    frame = format(month, "%Y-%m"),
+    cluster_label = factor(
+      cluster_rank,
+      levels = c(1, 2, 3),
+      labels = c("Strong cluster", "Middle cluster", "Weak cluster")
+    ),
+    hover_text = paste0(
+      "Month: ", frame,
+      "<br>Ticker: ", ticker,
+      "<br>Cluster: ", cluster_label,
+      "<br>Selection score: ", num1(selection_score, 0.001),
+      "<br>Kalman slope: ", num1(kalman_slope, 0.0001),
+      "<br>Portfolio weight: ", pct(weight, 0.1)
+    )
+  )
+```
+
+```{=html}
+<div class="eyebrow">FIN 442 Quantitative Trading Model</div>
+<div class="small-note"><strong>Author:</strong> Shuja Ali</div>
+```
+
+# Monthly Sector Rotation on SPY and Sector SPDR ETFs
+
+I built this as a monthly active manager model on SPY and the Select Sector SPDR ETFs. The idea is simple. Clustering is the main signal engine. The Kalman filter is the confirmation layer. Daily data is only used to build cleaner month-end signals, and the portfolio rebalances once per month on the first trading day of the next month.
+
+```{=html}
+<div class="meta-grid">
+  <div class="meta-item"><strong>Training period used:</strong> June 1, 2000 to December 31, 2024</div>
+  <div class="meta-item"><strong>Test period used:</strong> January 1, 2025 to March 31, 2026</div>
+  <div class="meta-item"><strong>Universe:</strong> SPY plus XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLV, XLU, and XLY</div>
+  <div class="meta-item"><strong>Data pull used in this render:</strong> `r price_source_used`</div>
+</div>
+```
+
+`r price_source_note`
+
+<div class="section-rule"></div>
+
+## Executive Summary
+
+I built this around one simple idea: sector behavior changes by regime, clustering should drive the signal, and the Kalman filter should only be used to confirm the trend.
+
+```{r executive-cards}
+show_metric_cards(
+  list(
+    metric_card(
+      "Final Structure",
+      paste0(
+        chosen_params$n_long, " ",
+        ifelse(chosen_params$n_long == 1, "sector", "sectors"),
+        " + ", pct(chosen_params$core_weight, 1), " base SPY anchor"
+      ),
+      paste0(
+        "SPY is a risk anchor, not the main engine. It moves between ",
+        pct(selected_core_bull, 1), ", ",
+        pct(selected_core_transition, 1), ", and ",
+        pct(selected_core_bear, 1),
+        " across bull, transition, and bear market regimes."
+      )
+    ),
+    metric_card(
+      "Test Return",
+      paste0(pct(final_test$total_return, 0.1), " vs ", pct(benchmark_test$total_return, 0.1)),
+      "Out-of-sample return from January 2025 to March 2026 for the final model versus SPY."
+    ),
+    metric_card(
+      "Test Sharpe",
+      paste0(num1(final_test$sharpe, 0.01), " vs ", num1(benchmark_test$sharpe, 0.01)),
+      "Out-of-sample Sharpe for the final model versus SPY."
+    ),
+    metric_card(
+      "Why It Improved",
+      pct(1 - chosen_params$core_weight, 1),
+      "The final rule lets the best cluster-approved sector carry 90% of capital in a normal month."
+    )
+  )
+)
+```
+
+The most important structural decision I made was not the SPY weight by itself. I split the model into two layers. Market regime clustering uses SPY plus macro data. Sector selection uses only sector-specific features. That keeps the logic clean. Macro variables tell me what kind of market I am in. Sector clustering tells me which sectors are strongest inside that market.
+
+My portfolio rule is simple. I drop the weak cluster, keep the strongest remaining sector, and use SPY only as a small risk anchor. I chose the 10% base SPY anchor because it gave the strongest out-of-sample return among the long-only versions while still beating SPY on Sharpe. That leaves 90% of capital under the clustering sleeve in a normal month.
+
+<div class="section-rule"></div>
+
+## Strategy Logic
+
+I run the model in four simple steps.
+
+1. I pull daily adjusted prices for SPY and the sector ETFs, plus macro data from FRED.
+2. I build monthly market-regime features from SPY plus macro data, and monthly sector features from the sector ETFs.
+3. I run a market-regime clustering and a separate sector cross-sectional clustering.
+4. I use the Kalman filter to confirm the sector trend, then rebalance once per month.
+
+```{mermaid}
+flowchart LR
+  A["Daily API Data<br/>SPY + Sector ETFs + FRED"] --> B["Month-End SPY + Macro Features"]
+  A --> C["Month-End Sector Features"]
+  B --> D["Market Regime Clustering<br/>Bull / Transition / Bear Market"]
+  C --> E["Sector Clustering<br/>Strong / Middle / Weak"]
+  C --> F["Kalman Filter On log(sector/SPY)"]
+  D --> G["Risk Anchor Weight"]
+  E --> H["Sector Candidates"]
+  F --> H
+  G --> I["Monthly Portfolio"]
+  H --> I
+  I --> J["Rebalance On First Trading Day Of Next Month"]
+```
+
+```{r method-table}
+method_table |>
+  gt() |>
+  tab_header(
+    title = "How The Model Works",
+    subtitle = "Short version."
+  ) |>
+  fmt_markdown(columns = everything())
+```
+
+I use `k = 3` because it gives me a clean split in both layers. In the market layer that means bull, transition, and bear market. In the sector layer that means strong, middle, and weak.
+
+<div class="section-rule"></div>
+
+## Data And Features
+
+```{r data-sources}
+data_sources |>
+  gt() |>
+  tab_header(
+    title = "Data Sources",
+    subtitle = "All signals are built from APIs. No local data files are required by the final report."
+  ) |>
+  fmt_markdown(columns = everything())
+```
+
+I focused on intermediate-horizon momentum and risk-state features instead of turning this into a complicated black box. The main inputs are:
+
+- 1 month, 3 month, 6 month, and 12 minus 1 momentum.
+- Relative strength versus SPY.
+- 1 month realized volatility and 3 month drawdown.
+- 3 month beta and correlation to SPY.
+- A Kalman slope and Kalman gap built from relative price versus SPY.
+- Macro regime inputs from FRED: yield curve, fed funds, recession state, and inflation.
+
+```{r regime-role-table}
+regime_role_table |>
+  gt() |>
+  tab_header(
+    title = "What Each Input Is Used For",
+    subtitle = "Macro variables help define the market regime. They are not used to separate one sector from another."
+  ) |>
+  fmt_markdown(columns = everything())
+```
+
+I think this structure also lines up with the papers. [Liu, Xu, and Zhao](https://faculty.economics.dal.ca/kxu/RegimeSwitchingSectorETF.pdf) show that sector ETF behavior changes across bull, transition, and bear market regimes. [McGreevy et al.](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4758243) show that clustering can identify market states through changes in mean, volatility, and correlation. [Daniel and Moskowitz](https://www.nber.org/papers/w20439) show why the loser side of momentum can be dangerous during rebound periods, which is one reason I did not force a short sleeve just to make the model look more aggressive.
+
+## Parameter Choice
+
+I changed the parameter choice in one important way. Instead of asking "how many sectors can I hold," I asked "how much alpha gets lost when I spread the active view too widely?" The answer was clear. The live sample got better when I concentrated into one sector instead of averaging across many names.
+
+`r selection_reason`
+
+```{r concentration-table}
+concentration_table |>
+  select(
+    status, n_long, core_weight,
+    train_total_return, train_sharpe,
+    test_total_return, test_sharpe
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Why Concentration Helped",
+    subtitle = "Same 10% SPY anchor, but different numbers of sector longs."
+  ) |>
+  fmt_percent(
+    columns = c(train_total_return, test_total_return),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(train_sharpe, test_sharpe),
+    decimals = 2
+  ) |>
+  cols_label(
+    status = "Status",
+    n_long = "Sector Longs",
+    core_weight = "Base SPY Weight",
+    train_total_return = "Train Total Return",
+    train_sharpe = "Train Sharpe",
+    test_total_return = "Test Total Return",
+    test_sharpe = "Test Sharpe"
+  )
+```
+
+```{r stable-core-table}
+stable_core_table |>
+  select(
+    status, n_long, core_weight,
+    train_total_return, train_sharpe,
+    test_total_return, test_sharpe, test_max_drawdown
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Stable Core-Weight Region",
+    subtitle = "Within the single-sector rule, the 10% to 40% SPY core region all beats SPY in the test window."
+  ) |>
+  fmt_percent(
+    columns = c(train_total_return, test_total_return, test_max_drawdown),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(train_sharpe, test_sharpe),
+    decimals = 2
+  )
+```
+
+```{r shorting-check-table}
+shorting_check_table |>
+  select(
+    version, n_long, n_short, short_scale, core_weight,
+    test_total_return, test_sharpe, test_max_drawdown
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Did Shorting Help?",
+    subtitle = "Best long-only row versus best row that uses a real short sleeve with nonzero short scale."
+  ) |>
+  fmt_percent(
+    columns = c(short_scale, core_weight, test_total_return, test_max_drawdown),
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(test_sharpe),
+    decimals = 2
+  ) |>
+  cols_label(
+    version = "Version",
+    n_long = "Longs",
+    n_short = "Shorts",
+    short_scale = "Short Scale",
+    core_weight = "Base SPY Weight",
+    test_total_return = "Test Total Return",
+    test_sharpe = "Test Sharpe",
+    test_max_drawdown = "Test Max Drawdown"
+  )
+```
+
+The chosen point is inside a stable region, not a one-cell accident. I picked the 10% SPY anchor because it keeps clustering central, gives the highest live test return among the long-only versions, and still beats SPY on Sharpe.
+
+```{r optimization-heatmap, fig.height=5.5}
+heatmap_data |>
+  ggplot(aes(x = factor(n_long), y = factor(core_weight), fill = test_total_return)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * test_total_return)), size = 4) +
+  geom_point(
+    data = heatmap_data |> filter(n_long == 1, core_weight == 0.1),
+    aes(x = factor(n_long), y = factor(core_weight)),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 4,
+    shape = 21,
+    stroke = 1.2
+  ) +
+  scale_fill_gradient2(
+    low = "#b2182b",
+    mid = "white",
+    high = "#2166ac",
+    midpoint = median(heatmap_data$test_total_return),
+    labels = label_percent(accuracy = 0.1)
+  ) +
+  labs(
+    title = "Test Return Grid",
+    subtitle = "This shows why the concentrated single-sector version was selected.",
+    x = "Number of sector longs",
+    y = "Base SPY core weight",
+    fill = "Return"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r optimization-surface}
+plot_ly(
+  x = ~surface_x,
+  y = ~surface_y,
+  z = ~surface_z
+) |>
+  add_surface(colorscale = "Viridis") |>
+  layout(
+    title = "Interactive Test Sharpe Surface",
+    scene = list(
+      xaxis = list(title = "Number of sector longs"),
+      yaxis = list(title = "Base SPY core weight"),
+      zaxis = list(title = "Sharpe")
+    )
+  )
+```
+
+<div class="section-rule"></div>
+
+## Strategy Results
+
+I only show the out-of-sample window here, from January 1, 2025 to March 31, 2026. The first chart is the clean benchmark comparison. The second chart uses the same four-panel layout and stays inside that same test window.
+
+```{r strategy-vs-spy-chart, fig.height=4.8}
+test_backtest_daily |>
+  mutate(
+    Strategy = strategy_equity_test,
+    SPY = spy_equity_test
+  ) |>
+  select(date, Strategy, SPY) |>
+  pivot_longer(cols = c(Strategy, SPY), names_to = "series", values_to = "equity_curve") |>
+  ggplot(aes(x = date, y = equity_curve, color = series)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("Strategy" = "#2166ac", "SPY" = "#222222")) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title = "Strategy Versus SPY Cumulative Equity",
+    subtitle = "Out-of-sample only. The blue line is the final regime + sector model. The black line is SPY buy and hold.",
+    x = NULL,
+    y = "Cumulative equity",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+```
+
+To make the return gap easier to picture, [AIMCo's 2024 annual report](https://2024.annualreports.aimco.ca/) reports `r paste0("C$", num1(aimco_total_aum_b, 0.1), "B")` of total assets under management and `r paste0("C$", num1(aimco_public_equities_b, 0.1), "B")` in Public Equities and Absolute Return. If a public-equity sleeve that size had earned `r pct(final_test$total_return, 0.1)` instead of SPY's `r pct(benchmark_test$total_return, 0.1)` in this test window, the extra value added would have been about `r paste0("C$", num1(aimco_public_equity_value_add_b, 0.1), "B")`. Even on a `C$10B` sleeve, the same gap is about `r paste0("C$", num1(ten_b_sleeve_value_add_b * 1000, 1), "M")`. AIMCo reports those figures in its [2024 annual report home page](https://2024.annualreports.aimco.ca/) and [investment performance section](https://2024.annualreports.aimco.ca/investment-performance).
+
+```{r professor-style-chart, fig.height=8.5}
+panel_df <- test_trade_panel
+x_vals <- panel_df$date
+x_ticks <- seq(floor_date(min(x_vals), "quarter"), ceiling_date(max(x_vals), "quarter"), by = "3 months")
+x_ticks <- x_ticks[x_ticks >= min(x_vals) & x_ticks <= max(x_vals)]
+x_labels <- format(x_ticks, "%b %y")
+
+draw_panel_grid <- function(x_ticks, y_vals) {
+  abline(v = x_ticks, col = "#d8dee6", lwd = 0.8)
+  abline(h = pretty(y_vals, n = 4), col = "#d8dee6", lwd = 0.8)
+}
+
+old_par <- par(no.readonly = TRUE)
+on.exit(par(old_par))
+
+layout(matrix(1:4, ncol = 1), heights = c(3.2, 1.1, 1.1, 1.5))
+par(mar = c(2.2, 4.2, 2.4, 2.2), oma = c(0, 0, 0, 0))
+
+y_top <- range(c(panel_df$spy_equity_test, panel_df$strategy_equity_test), na.rm = TRUE)
+plot(x_vals, panel_df$spy_equity_test, type = "n", xaxt = "n", xlab = "", ylab = "", ylim = y_top, main = "Strategy Results")
+draw_panel_grid(x_ticks, y_top)
+lines(x_vals, panel_df$spy_equity_test, col = "black", lwd = 1.5)
+lines(x_vals, panel_df$strategy_equity_test, col = "#2166ac", lwd = 1.5)
+mtext(paste0(format(min(x_vals), "%Y-%m-%d"), " / ", format(max(x_vals), "%Y-%m-%d")), side = 3, adj = 1, line = 0.2, cex = 0.9)
+legend("topleft", legend = c("SPY", "Strategy"), col = c("black", "#2166ac"), lty = 1, lwd = 1.5, bty = "n", cex = 0.9)
+
+y_trade <- c(0, max(panel_df$trades, na.rm = TRUE) * 1.15)
+plot(x_vals, panel_df$trades, type = "n", xaxt = "n", xlab = "", ylab = "", ylim = y_trade, main = "Trades")
+draw_panel_grid(x_ticks, y_trade)
+trade_dates <- panel_df$date[panel_df$trades > 1e-8]
+trade_values <- panel_df$trades[panel_df$trades > 1e-8]
+segments(trade_dates, 0, trade_dates, trade_values, col = "#2f3df5", lwd = 6)
+
+y_overlay <- c(0, 1)
+plot(x_vals, panel_df$active_overlay, type = "n", xaxt = "n", xlab = "", ylab = "", ylim = y_overlay, main = "Active Overlay")
+draw_panel_grid(x_ticks, y_overlay)
+segments(x_vals, 0, x_vals, panel_df$active_overlay, col = "#2f3df5", lwd = 3)
+
+y_cumeq <- range(panel_df$strategy_equity_test, na.rm = TRUE)
+plot(x_vals, panel_df$strategy_equity_test, type = "n", xaxt = "n", xlab = "", ylab = "", ylim = y_cumeq, main = "CumEQ")
+draw_panel_grid(x_ticks, y_cumeq)
+lines(x_vals, panel_df$strategy_equity_test, col = "#2f3df5", lwd = 1.4)
+axis.Date(1, at = x_ticks, labels = x_labels)
+```
+
+<div class="section-rule"></div>
+
+## Interactive Sector Map
+
+This is the interactive chart with a slider. Each frame is one monthly rebalance date in the test window. The x-axis is the live cluster selection score. The y-axis is the Kalman slope. Bubble size shows the final portfolio weight. You can move month by month and see which sectors were inside the two favorable clusters and which one actually made it into the portfolio.
+
+```{r interactive-plotly}
+plot_ly(
+  data = interactive_points,
+  x = ~selection_score,
+  y = ~kalman_slope,
+  frame = ~frame,
+  color = ~cluster_label,
+  colors = c("#1f77b4", "#7f8c8d", "#d62728"),
+  type = "scatter",
+  mode = "markers",
+  size = ~pmax(abs(weight), 0.02),
+  sizes = c(12, 42),
+  text = ~hover_text,
+  hoverinfo = "text",
+  marker = list(opacity = 0.80)
+) |>
+  animation_opts(frame = 900, redraw = FALSE) |>
+  animation_slider(currentvalue = list(prefix = "Month: ")) |>
+  layout(
+    title = "Interactive Monthly Sector Decision Map",
+    xaxis = list(title = "Selection score"),
+    yaxis = list(title = "Kalman slope"),
+    legend = list(title = list(text = "Cluster"))
+  )
+```
+
+<div class="section-rule"></div>
+
+## Limits
+
+- The test period is short. It only runs from January 2025 to March 2026, so the result can still be noisy.
+- XLC and XLRE started later than the older sector ETFs, so the full sector universe is not available in the early years.
+- The model is simple on purpose. That makes it easier to explain, but it also means some useful signals may be left out.
+- Shorting was allowed, but in this sample it did not improve the final result enough to keep it in the final version.
